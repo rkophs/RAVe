@@ -7,6 +7,8 @@ import struct
 import textwrap
 from Crypto.Cipher import AES
 
+#Performs the encryption and decryption of a message in AES/CTR/256 with padding
+#Encryption additionally encrypts a final block containing an expiration token and message length
 class Cipher:
 
 	@staticmethod 
@@ -30,13 +32,17 @@ class Cipher:
 		self.cnter_cb_called = 0 
 		self.secret = nonce
 
+	#Called by AES routine for each block. Returns [ctr_rand_nonce + counter++]
 	def _counter_callback(self):
 		self.cnter_cb_called += 1
 		return self.secret + Cipher._int64_to_bytes(self.cnter_cb_called)
 
+	#Return the encrypted tokens block (must call encrypt() first)
 	def tag(self ):
 		return self.enc_tag
 
+	#Encrypt a message and appropriate tokens into final block. 
+	# Does not add final block to the cipher text. Stores it locall rather.
 	def encrypt(self, raw, expireTime):
 		cipher = AES.new( self.enc_key, AES.MODE_CTR, counter = self._counter_callback )
 		raw_padded = Cipher.pad(raw)
@@ -48,18 +54,22 @@ class Cipher:
 
 		return enc_padded
 
+	#Return the expiration within an encrypted tag. Must call decryptTokens() first
 	def expiration(self):
 		return self.expireToken
 
+	#Return the msgLen within an encrypted tag. Must call decryptTokens() first
 	def msgLen(self):
 		return self.msgLenToken
 
+	#Decrypt a ciphertext.
 	def decrypt(self, enc):
 		self.cnter_cb_called = 0
 		cipher = AES.new(self.enc_key, AES.MODE_CTR, counter = self._counter_callback)
 		raw_padded = cipher.decrypt(enc)
 		return Cipher.unpad(raw_padded)
 
+	#Decrypt encrypted tokens
 	def decryptTokens(self, offset, tag):
 		self.cnter_cb_called = offset
 		cipher = AES.new(self.enc_key, AES.MODE_CTR, counter = self._counter_callback)
@@ -67,11 +77,13 @@ class Cipher:
 		self.expireToken = int(str(dec_tag[8:16]).encode('hex'), 16)
 		self.msgLenToken = int(str(dec_tag[0:8]).encode('hex'), 16)
 
+#Produce a mac from a cipher text and encrypted tokens
 class Signer:
 
 	def __init__(self, auth_key):
 		self.auth_key = auth_key
 
+	#Keccak 256bit hash
 	def _hash(self, a, b):
 		s = sha3.SHA3256()
 		s.update(''.join([a,b]))
@@ -87,6 +99,8 @@ class Signer:
 			half = length // 2;
 			return self._hash(self._merkle_hash(inputs[:half]), self._merkle_hash(inputs[half:]))
 
+    #Build root of merkle tree from blocks of ciphertext. 
+    # HMAC the root, auth_key and encrypted tokens to produce a mac
 	def mac(self, ciphertext, enc_tag):
 		root = self._merkle_hash(textwrap.wrap(ciphertext, 16))
 		
@@ -94,6 +108,9 @@ class Signer:
 		s.update(''.join([root, self.auth_key, enc_tag]))
 		return s.hexdigest()
 
+#Verifiy a cipher text & encrypted tag against a provided MAC
+# Must not only match the mac, but check that the message is not expired and that the length
+# is correct
 class Verifier:
 	def __init__(self, auth_key, enc_key, enc_nonce):
 		self.signer = Signer(auth_key)
