@@ -2,27 +2,16 @@ import hashlib
 import sha3
 import math
 import time
-
-# Abigail Hertz
-# Vidit Jain
-# Ryan Kophs
-# Project 2 Code
 import binascii
 from Crypto.Cipher import AES
 
-# Abigail Hertz
-# Vidit Jain
-# Ryan Kophs
-# Project 2 Code
-
 def AES_Function(value, key):
-    cipher = AES.new(binascii.unhexlify(key), AES.MODE_ECB)    # Create AES cipher suite using the key
+    cipher = AES.new(key, AES.MODE_ECB)    						# Create AES cipher suite using the key
     ciphertext = cipher.encrypt(binascii.unhexlify(value))     # Encrypt the plaintext block given
     return binascii.hexlify(ciphertext)                        # Return the hex of the ciphertext
 
 def encryptCTR(message, nonce, key):
     binNonce =  binascii.hexlify(nonce)            # Convert the nonce to hex
-    binKey = binascii.hexlify(key)           # Convert the key to hex
     for i in range(0,16):             
         binNonce = binNonce + '0'        # Add the rest trailing 0s for first counter
         
@@ -34,7 +23,7 @@ def encryptCTR(message, nonce, key):
     count = 0
     for i in range(0, len(message) - 32, 32):     # Go through each block and decrypt
         val = message[i:(i+len(binNonce))]              # Isolate a 16 byte block
-        ciphertext = AES_Function(binNonce, binKey)       # Run the current block through AES using the key
+        ciphertext = AES_Function(binNonce, key)       # Run the current block through AES using the key
         intCipher = int(ciphertext,16)                  # Convert to int to be XORed
         intVal = int(val,16)                            # Convert to int to be XORed
         xorVal = intVal ^ intCipher                     # XOR the two values
@@ -43,7 +32,7 @@ def encryptCTR(message, nonce, key):
         count = count + 1
         binNonce = binNonce[0:31] + str(count)
         
-    ciphertext = AES_Function(binNonce, binKey)
+    ciphertext = AES_Function(binNonce, key)
     intCipher = int(ciphertext, 16)
     intVal = int(binAD, 16)
     xorVal = intVal ^ intCipher
@@ -85,7 +74,7 @@ def encryptCTR(message, nonce, key):
     count = 0
     for i in range(0, len(binMessage), 32):     # Go through each block and encrypt
         val = binMessage[i:(i+len(binNonce))]              # Isolate a 16 byte block
-        ciphertext = AES_Function(binNonce, binKey)       # Run the current block through AES using the key
+        ciphertext = AES_Function(binNonce, key)       # Run the current block through AES using the key
         intCipher = int(ciphertext,16)                  # Convert to int to be XORed
         intVal = int(val,16)                            # Convert to int to be XORed
         xorVal = intVal ^ intCipher                     # XOR the two values
@@ -94,7 +83,7 @@ def encryptCTR(message, nonce, key):
         count = count + 1
         binNonce = binNonce[0:31] + str(count)
         
-    ciphertext = AES_Function(binNonce, binKey)
+    ciphertext = AES_Function(binNonce, key)
     intCipher = int(ciphertext, 16)
     intVal = int(binAD,16)
     xorVal = intVal ^ intCipher
