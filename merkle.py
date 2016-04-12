@@ -3,151 +3,133 @@ import sha3
 import math
 import time
 import binascii
+import struct
+import textwrap
 from Crypto.Cipher import AES
 
-def AES_Function(value, key):
-    cipher = AES.new(key, AES.MODE_ECB)    						# Create AES cipher suite using the key
-    ciphertext = cipher.encrypt(binascii.unhexlify(value))     # Encrypt the plaintext block given
-    return binascii.hexlify(ciphertext)                        # Return the hex of the ciphertext
+class Cipher:
 
-def encryptCTR(message, nonce, key):
-    binNonce =  binascii.hexlify(nonce)            # Convert the nonce to hex
-    for i in range(0,16):             
-        binNonce = binNonce + '0'        # Add the rest trailing 0s for first counter
-        
-    numBlocks = len(message)/32
-    
-    binAD = message[32*(numBlocks-1):]
-        
-    cipherArray = []
-    count = 0
-    for i in range(0, len(message) - 32, 32):     # Go through each block and decrypt
-        val = message[i:(i+len(binNonce))]              # Isolate a 16 byte block
-        ciphertext = AES_Function(binNonce, key)       # Run the current block through AES using the key
-        intCipher = int(ciphertext,16)                  # Convert to int to be XORed
-        intVal = int(val,16)                            # Convert to int to be XORed
-        xorVal = intVal ^ intCipher                     # XOR the two values
-        xorVal = '{:x}'.format(xorVal)                  # Convert back to hex from int
-        cipherArray.append(xorVal)                  # Add the block to the array of ciphertexts
-        count = count + 1
-        binNonce = binNonce[0:31] + str(count)
-        
-    ciphertext = AES_Function(binNonce, key)
-    intCipher = int(ciphertext, 16)
-    intVal = int(binAD, 16)
-    xorVal = intVal ^ intCipher
-    xorVal = '{:x}'.format(xorVal)
-    cipherArray.append(xorVal)
-        
-    print(binascii.unhexlify(''.join(cipherArray[:-1])))                        # Concatenate all ciphertexts together to get final ciphertext
+	BS = AES.block_size
 
-    lastBlock = cipherArray[-1]
-    print(binascii.unhexlify(lastBlock[:16]))
-    print(int(lastBlock[16:], 16))
+	@staticmethod 
+	def pad( s ):
+		return s + (Cipher.BS - len(s) % Cipher.BS) * chr(Cipher.BS - len(s) % Cipher.BS)
 
-def main2():
-    message = '9b53cdb14f7026ad2e8411c2a03fce48961058bd9e0e280996efd9d060923eb32b42e9b58e9c63a137037d66245ae19a73e6a6c3cae9b44cd310f35b4db8470b' #'9b53cdb14f7026ad2e8411c2a03fce48961058bd9e0e280996efd9d060923eb32b42e9b58e9c63a137037d66245ae19a73e6a6c3f9d18774d310f35b4db84c9c'    # The message to be encrypted
-    nonce = "hi nonce"               # The nonce
-    key = "sixteen byte keysixteen byte key"              # The thirty two byte key
-    encryptCTR(message, nonce, key)          # Run CTR mode
-main2()
+	@staticmethod
+	def unpad( s ):
+		return s[0:-ord(s[-1])]
 
-def encryptCTR(message, nonce, key):
-    binMessage = binascii.hexlify(message)
-    binNonce =  binascii.hexlify(nonce)            # Convert the nonce to hex
-    binKey = binascii.hexlify(key)           # Convert the key to hex
-    binLen = binascii.hexlify(str(len(message)))
-    expirationToken = int(time.time())
-    binTime = '{:x}'.format(expirationToken)
-    for i in range(0,16):             
-        binNonce = binNonce + '0'        # Add the rest trailing 0s for first counter
-        
-    for i in range(0, len(binLen) % 16):
-        binLen = binLen + '0'
-        
-    for i in range(0, len(binTime) % 16):
-        binTime = '0' + binTime
-        
-    binAD = binLen + binTime
-        
-    cipherArray = []
-    count = 0
-    for i in range(0, len(binMessage), 32):     # Go through each block and encrypt
-        val = binMessage[i:(i+len(binNonce))]              # Isolate a 16 byte block
-        ciphertext = AES_Function(binNonce, key)       # Run the current block through AES using the key
-        intCipher = int(ciphertext,16)                  # Convert to int to be XORed
-        intVal = int(val,16)                            # Convert to int to be XORed
-        xorVal = intVal ^ intCipher                     # XOR the two values
-        xorVal = '{:x}'.format(xorVal)                  # Convert back to hex from int
-        cipherArray.append(xorVal)                  # Add the block to the array of ciphertexts
-        count = count + 1
-        binNonce = binNonce[0:31] + str(count)
-        
-    ciphertext = AES_Function(binNonce, key)
-    intCipher = int(ciphertext, 16)
-    intVal = int(binAD,16)
-    xorVal = intVal ^ intCipher
-    xorVal = '{:x}'.format(xorVal)
-    cipherArray.append(xorVal)
-    print(cipherArray)                         # Concatenate all ciphertexts together to get final ciphertext
+	@staticmethod
+	def _int64_to_bytes(self, x):
+		result = chr((x >> 56) & 0xFF) + chr((x >> 48) & 0xFF)
+		result += chr((x >> 40) & 0xFF) + chr((x >> 32) & 0xFF)
+		result += chr((x >> 24) & 0xFF) + chr((x >> 16) & 0xFF)
+		result += chr((x >> 8) & 0xFF) + chr(x & 0xFF)
+		return result
+		
+	def __init__(self, enc_key, nonce):
+		self.enc_key = enc_key
+		self.cnter_cb_called = 0 
+		self.secret = nonce
+
+	def _counter_callback( self ):
+		self.cnter_cb_called += 1
+		return self.secret + self._int64_to_bytes(self.cnter_cb_called)
+
+	def tag(self ):
+		return self.enc_tag
+
+	def encrypt(self, raw, expireTime):
+		cipher = AES.new( self.enc_key, AES.MODE_CTR, counter = self._counter_callback )
+		raw_padded = Cipher.pad(raw)
+		enc_padded = cipher.encrypt(raw_padded)
+
+		expiration = self._int64_to_bytes(expireTime)
+		msgLen = self._int64_to_bytes(len(enc_padded))
+		self.enc_tag = cipher.encrypt(msgLen + expiration)
+
+		return enc_padded
+
+	def expiration(self):
+		return self.expireToken
+
+	def msgLen(self):
+		return self.msgLenToken
+
+	def decrypt(self, enc):
+		self.cnter_cb_called = 0
+		cipher = AES.new(self.enc_key, AES.MODE_CTR, counter = self._counter_callback)
+		raw_padded = cipher.decrypt(enc)
+		return Cipher.unpad(raw_padded)
+
+	def decryptTokens(self, offset, tag):
+		self.cnter_cb_called = offset
+		cipher = AES.new(self.enc_key, AES.MODE_CTR, counter = self._counter_callback)
+		dec_tag = cipher.decrypt(tag)
+		self.expireToken = int(str(dec_tag[8:16]).encode('hex'), 16)
+		self.msgLenToken = int(str(dec_tag[0:8]).encode('hex'), 16)
+
+class Signer:
+
+	def __init__(self, auth_key):
+		self.auth_key = auth_key
+
+	def _hash(self, a, b):
+		s = sha3.SHA3256()
+		s.update(''.join([a,b]))
+		return s.hexdigest()
+
+	def _merkle_hash(self, inputs):
+		length = len(inputs)
+		if length == 0:
+			return inputs
+		elif length == 1:
+			return inputs[0]
+		else:
+			half = length // 2;
+			return self._hash(self._merkle_hash(inputs[:half]), self._merkle_hash(inputs[half:]))
+
+	def mac(self, ciphertext, enc_tag):
+		root = self._merkle_hash(textwrap.wrap(ciphertext, 16))
+		
+		s = sha3.SHA3256()
+		s.update(''.join([root, self.auth_key, enc_tag]))
+		return s.hexdigest()
+
+class Verifier:
+	def __init__(self, auth_key, enc_key, enc_nonce):
+		self.signer = Signer(auth_key)
+		self.cipher = Cipher(enc_key, enc_nonce)
+
+	def verify(self, ciphertext, enc_tag, mac):
+		self.cipher.decryptTokens((len(ciphertext) // 16), enc_tag)
+		return self._validMac(ciphertext, enc_tag, mac) and self._timely() and self._validMsgLength()
+
+	def _validMac(self, ciphertext, enc_tag, mac):
+		return self.signer.mac(ciphertext, enc_tag) == mac
+
+	def _timely(self):
+		return self.cipher.expiration() > time.time()
+
+	def _validMsgLength(self):
+		return self.cipher.msgLen() == len(ciphertext)
 
 def main():
-    message = "Multiple messageMultiple messageMultip"    # The message to be encrypted
-    nonce = "hi nonce"               # The initialization vector
-    key = "sixteen byte keysixteen byte key"              # The thirty two byte key
-    encryptCTR(message, nonce, key)          # Run CBC mode
+	auth_key = "0123456789abcdef"
+	enc_key = "0123456789012345"
+	enc_nonce = "01234567"
 
-def hmac(nonce, key, msg):
-	s = sha3.SHA3256()
-	s.update(''.join([nonce, key, msg]))
-	return s.hexdigest()
+	enc_cipher = Cipher(enc_key, enc_nonce)
+	dec_cipher = Cipher(enc_key, enc_nonce)
 
-def verify_tag(nonce, key, msg, tag):
-	return hmac(nonce, key, msg) == tag
+	ciphertext = enc_cipher.encrypt("0123456789abcdef0123456789ABCDEF", int(time.time()+1000))
+	enc_tag = enc_cipher.tag()
 
-def verify(auth_key, enc_key, enc_nonce, ciphertext, root, tag):
-	if verify_tag(root, auth_key, ciphertext[-1], tag):
-		#results is array of: [plaintext msg, msgLen, expirationToken]
-		results = ["hello world", 11, 1480459664] #decrypt(key, nonce, ciphertext)
-		msg = results[0]
-		msgLen = results[1]
-		if(len(msg) != msgLen):
-			return False
-		expirationToken = results[2]
-		if (expirationToken < time.time()):
-			return False
-		return True
-	else: 
-		return False
+	signer = Signer(auth_key)
+	mac = signer.mac(ciphertext, enc_tag)
 
-def hash(a, b):
-	s = sha3.SHA3256()
-	s.update(''.join([a,b]))
-	return s.hexdigest()
+	verifier = Verifier(auth_key, enc_key, enc_nonce)
+	verified = verifier.verify(ciphertext, enc_tag, mac)
 
-def merkle_hash(inputs):
-	length = len(inputs)
-	if length == 0:
-		return inputs
-	elif length == 1:
-		return inputs[0]
-	else:
-		half = length // 2;
-		return hash(merkle_hash(inputs[:half]), merkle_hash(inputs[half:]))
-
-
-auth_key = 'auth key'
-enc_key = 'enc key'
-enc_nonce = 'enc nonce'
-msg = 'hello world'
-
-ciphertext = ['cipher block 1', 'cipher block 2', 'cipher block 3', 'cipher block 4']; #encrypt(enc_key, nonce, msg)
-root = merkle_hash(ciphertext)
-tag = hmac(root, auth_key, ciphertext[-1])
-
-#Transmit over wire at this point
-
-#verified = verify(auth_key, enc_key, enc_nonce, ciphertext, root, tag)
-#print verified
-main()
-
+	print(verified)
+	print(dec_cipher.decrypt(ciphertext))
