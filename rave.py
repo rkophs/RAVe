@@ -20,6 +20,12 @@ class Cipher:
 		return s[0:-ord(s[-1])]
 
 	@staticmethod
+	def _int32_to_bytes(x):
+		result == chr((x >> 24) & 0xFF) + chr((x >> 16) & 0xFF)
+		result += chr((x >> 8) & 0xFF) + chr(x & 0xFF)
+		return result
+
+	@staticmethod
 	def _int64_to_bytes(x):
 		result = chr((x >> 56) & 0xFF) + chr((x >> 48) & 0xFF)
 		result += chr((x >> 40) & 0xFF) + chr((x >> 32) & 0xFF)
@@ -35,7 +41,7 @@ class Cipher:
 	#Called by AES routine for each block. Returns [ctr_rand_nonce + counter++]
 	def _counter_callback(self):
 		self.cnter_cb_called += 1
-		return self.secret + Cipher._int64_to_bytes(self.cnter_cb_called)
+		return self.secret + Cipher._int32_to_bytes(self.cnter_cb_called)
 
 	#Return the encrypted tokens block (must call encrypt() first)
 	def tag(self ):
@@ -134,7 +140,7 @@ def main():
 	expiration = int(time.time() + 1000)
 	auth_key = "0123456789abcdef"
 	enc_key = "0123456789012345"
-	enc_nonce = "01234567"
+	enc_nonce = "01234567890AB" #This should be random
 
 	enc_cipher = Cipher(enc_key, enc_nonce)
 	dec_cipher = Cipher(enc_key, enc_nonce)
