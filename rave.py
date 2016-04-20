@@ -100,7 +100,7 @@ class BlockLayers:
 		self.layer_count = int(math.ceil(math.log(entry_count,2)) + 1)
 		self.entry_count = entry_count
 		self.saveBlocks = saveBlocks
-		self.blocks = {}
+		self.blocks = []
 		self.encrypt = encrypt
 
 	def pushChild(self, layer, key, value):
@@ -118,12 +118,14 @@ class BlockLayers:
 			self.lock.release()
 			return
 		if self.saveBlocks:
-			self.blocks[key] = after_value
+			size = len(after_value)
+			loc = key*size
+			self.blocks[loc:loc+size] = after_value
 		self.results[0][key] = after_value if self.encrypt else before_value
 		self.lock.release()
 
 	def get_blocks(self):
-		return [value for (key, value) in sorted(self.blocks.items())]
+		return self.blocks
 
 	def get_root(self):
 		res = None
@@ -360,7 +362,7 @@ def rerun_anomolies():
 	print(len(msg))
 	gc.collect()
 	gc.collect()
-	benchmark(auth_key, enc_key, enc_nonce, msg, 4, 1)
+	benchmark(auth_key, enc_key, enc_nonce, msg, 16, 1)
 
 	gc.collect()
 	gc.collect()
