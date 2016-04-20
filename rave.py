@@ -1,15 +1,19 @@
-import hashlib
 import sha3
 import math
 import time
 import binascii
-import struct
-import textwrap
+import threading
+import Queue 
+import gc
 from Crypto.Cipher import AES
-
+		
 #Performs the encryption and decryption of a message in AES/CTR/256 with padding
 #Encryption additionally encrypts a final block containing an expiration token and message length
 class Cipher:
+
+	@staticmethod
+	def sxor(s1,s2):
+		return ''.join(chr(ord(a) ^ ord(b)) for a,b in zip(s1,s2))
 
 	@staticmethod 
 	def pad(s):
@@ -21,75 +25,25 @@ class Cipher:
 
 	@staticmethod
 	def _int32_to_bytes(x):
-		result == chr((x >> 24) & 0xFF) + chr((x >> 16) & 0xFF)
-		result += chr((x >> 8) & 0xFF) + chr(x & 0xFF)
-		return result
-
-	@staticmethod
-	def _int64_to_bytes(x):
-		result = chr((x >> 56) & 0xFF) + chr((x >> 48) & 0xFF)
-		result += chr((x >> 40) & 0xFF) + chr((x >> 32) & 0xFF)
-		result += chr((x >> 24) & 0xFF) + chr((x >> 16) & 0xFF)
+		result = chr((x >> 24) & 0xFF) + chr((x >> 16) & 0xFF)
 		result += chr((x >> 8) & 0xFF) + chr(x & 0xFF)
 		return result
 
 	def __init__(self, enc_key, nonce):
+		self.cipher = AES.new(enc_key, AES.MODE_ECB)
 		self.enc_key = enc_key
-		self.cnter_cb_called = 0 
 		self.secret = nonce
 
-	#Called by AES routine for each block. Returns [ctr_rand_nonce + counter++]
-	def _counter_callback(self):
-		self.cnter_cb_called += 1
-		return self.secret + Cipher._int32_to_bytes(self.cnter_cb_called)
+	def encrypt(self, block, counter):
+		iv = self.secret + Cipher._int32_to_bytes(counter);
+		enc = self.cipher.encrypt(iv)
+		return Cipher.sxor(block, enc);
 
-	#Return the encrypted tokens block (must call encrypt() first)
-	def tag(self ):
-		return self.enc_tag
-
-	#Encrypt a message and appropriate tokens into final block. 
-	# Does not add final block to the cipher text. Stores it locall rather.
-	def encrypt(self, raw, expireTime):
-		cipher = AES.new( self.enc_key, AES.MODE_CTR, counter = self._counter_callback )
-		raw_padded = Cipher.pad(raw)
-		enc_padded = cipher.encrypt(raw_padded)
-
-		expiration = self._int64_to_bytes(expireTime)
-		msgLen = self._int64_to_bytes(len(enc_padded))
-		self.enc_tag = cipher.encrypt(msgLen + expiration)
-
-		return enc_padded
-
-	#Return the expiration within an encrypted tag. Must call decryptTokens() first
-	def expiration(self):
-		return self.expireToken
-
-	#Return the msgLen within an encrypted tag. Must call decryptTokens() first
-	def msgLen(self):
-		return self.msgLenToken
-
-	#Decrypt a ciphertext.
-	def decrypt(self, enc):
-		self.cnter_cb_called = 0
-		cipher = AES.new(self.enc_key, AES.MODE_CTR, counter = self._counter_callback)
-		raw_padded = cipher.decrypt(enc)
-		return Cipher.unpad(raw_padded)
-
-	#Decrypt encrypted tokens
-	def decryptTokens(self, offset, tag):
-		self.cnter_cb_called = offset
-		cipher = AES.new(self.enc_key, AES.MODE_CTR, counter = self._counter_callback)
-		dec_tag = cipher.decrypt(tag)
-		self.expireToken = int(str(dec_tag[8:16]).encode('hex'), 16)
-		self.msgLenToken = int(str(dec_tag[0:8]).encode('hex'), 16)
-
-#Produce a mac from a cipher text and encrypted tokens
-class Signer:
-
-	def __init__(self, auth_key):
-		self.auth_key = auth_key
-
-	#Keccak 256bit hash
+class HashThread(threading.Thread):
+	def __init__(self, results):
+		threading.Thread.__init__(self)
+		self.results = results
+	
 	def _hash(self, a, b):
 		s = sha3.SHA3256()
 		s.update(''.join([a,b]))
@@ -101,60 +55,347 @@ class Signer:
 			return inputs
 		elif length == 1:
 			return inputs[0]
-		else:
+		elif length == 2:
 			half = length // 2;
 			return self._hash(self._merkle_hash(inputs[:half]), self._merkle_hash(inputs[half:]))
+		else:
+			print "ERROR"
+	def run(self):
+		while True:
+			next = self.results.pop();
+			if next == None:
+				continue
+			elif next == -1:
+				break
+			layer = next[0]
+			key = next[1]
+			inputs = next[2]
+			self.results.pushChild(layer + 1, key // 2, self._merkle_hash(inputs))
 
-    #Build root of merkle tree from blocks of ciphertext. 
-    # HMAC the root, auth_key and encrypted tokens to produce a mac
-	def mac(self, ciphertext, enc_tag):
-		root = self._merkle_hash(textwrap.wrap(ciphertext, 16))
-		
+class CipherThread (threading.Thread):
+
+	def __init__(self, enc_key, enc_nonce, queue, results):
+		threading.Thread.__init__(self)
+		self.enc_key = enc_key
+		self.enc_nonce = enc_nonce
+		self.queue = queue
+		self.results = results
+
+	def run(self):
+		while True:
+			tup = self.queue.get(); #[counter, block ]
+			if tup == None:
+				break
+			counter = tup[0]
+			block = tup[1]
+			cipher = Cipher(self.enc_key, self.enc_nonce)
+			enc = cipher.encrypt(block, counter)
+			self.results.pushBlock(counter, block, enc)
+
+class BlockLayers:
+	def __init__(self, entry_count, saveBlocks, encrypt):
+		self.lock = threading.Lock()
+		self.results = {}
+		self.results[0] = {}
+		self.layer_count = int(math.ceil(math.log(entry_count,2)) + 1)
+		self.entry_count = entry_count
+		self.saveBlocks = saveBlocks
+		self.blocks = {}
+		self.encrypt = encrypt
+
+	def pushChild(self, layer, key, value):
+		self.lock.acquire()
+		if not layer in self.results:
+			self.results[layer] = {}
+		self.results[layer][key] = value
+		self.lock.release()
+
+	def pushBlock(self, key, before_value, after_value):
+		self.lock.acquire()
+		if key == self.entry_count:
+			self.cipher_tag = after_value if self.encrypt else before_value
+			self.plain_tag = before_value if self.encrypt else after_value
+			self.lock.release()
+			return
+		if self.saveBlocks:
+			self.blocks[key] = after_value
+		self.results[0][key] = after_value if self.encrypt else before_value
+		self.lock.release()
+
+	def get_blocks(self):
+		return [value for (key, value) in sorted(self.blocks.items())]
+
+	def get_root(self):
+		res = None
+		self.lock.acquire()
+		res = self.root
+		self.lock.release()
+		return res
+
+	def get_cipher_tag(self):
+		return self.cipher_tag
+
+	def get_plain_tag(self):
+		return self.plain_tag
+
+	def pop(self):
+		self.lock.acquire()
+		if self.layer_count - 1 in self.results:
+			self.root = self.results[self.layer_count - 1][0]
+			self.lock.release()
+			return -1
+
+		expect = self.entry_count
+		for layer in sorted(self.results.keys()):
+			lastKey = -2
+			for key in sorted(self.results[layer].keys()):
+				##Two adjacent cipher blocks [0,1], [2,3], ...
+				if lastKey == key - 1 and (key % 2) == 1:
+					res = [layer, lastKey, [self.results[layer][lastKey], self.results[layer][key]]]
+					del self.results[layer][lastKey]
+					del self.results[layer][key]
+					self.lock.release()
+					return res
+				##Last cipher block expected
+				elif (key == expect - 1) and (key % 2 == 0):
+					res = [layer, key, [self.results[layer][key]]]
+					del self.results[layer][key]
+					self.lock.release()
+					return res
+				lastKey = key
+			expect = (expect + (expect % 2)) // 2
+		self.lock.release()
+		return None
+
+	def printlayers(self):
+		self.lock.acquire()
+		for layer in self.results:
+			#print "  Layer " + str(layer) + ":" + str(len(self.results[layer]))
+			if layer == 0:
+				if(len(self.results[layer])) > 0:
+					print sorted(self.results[layer].keys())
+		self.lock.release()
+
+	def printresults(self):
+		self.lock.acquire()
+		print "{"
+		for layer in self.results:
+			print "  Layer " + str(layer) + ":"
+			for key in self.results[layer]:
+				print "    " + str(key) + ": " + binascii.hexlify(self.results[layer][key])
+		print "}"
+		self.lock.release()
+
+class Producer(threading.Thread):
+
+	def __init__(self, blocks, tag, queue, qsize):
+		threading.Thread.__init__(self)
+		self.blocks = blocks
+		self.qsize = qsize
+		self.queue = queue
+		self.tag = tag
+
+	def run(self):
+		blockCount = len(self.blocks)
+		self.queue.put([blockCount, self.tag])
+		for i in range(len(self.blocks)):
+			block = self.blocks[i]
+			self.queue.put([i, block])
+		for i in range(self.qsize):
+			self.queue.put(None)
+
+class RAVe:
+	@staticmethod
+	def _split_every(n, s):
+		return [ s[i:i+n] for i in xrange(0, len(s), n) ]
+
+	@staticmethod
+	def _int64_to_bytes(x):
+		result = chr((x >> 56) & 0xFF) + chr((x >> 48) & 0xFF)
+		result += chr((x >> 40) & 0xFF) + chr((x >> 32) & 0xFF)
+		result += chr((x >> 24) & 0xFF) + chr((x >> 16) & 0xFF)
+		result += chr((x >> 8) & 0xFF) + chr(x & 0xFF)
+		return result
+
+	def __init__(self, auth_key, enc_key, enc_nonce, threadCount):
+		self.auth_key = auth_key
+		self.enc_key = enc_key
+		self.enc_nonce = enc_nonce
+		self.threadCount = threadCount
+		self.queue = Queue.Queue(threadCount)
+
+	def _routine(self, blocks, tag, encrypt):
+		threads = []
+		producer = Producer(blocks, tag, self.queue, self.threadCount)
+		producer.start()
+		threads.append(producer)
+
+		hashState = BlockLayers(len(blocks), True, encrypt)
+
+		for i in range(self.threadCount):
+			cipherT = CipherThread(self.enc_key, self.enc_nonce, self.queue, hashState)
+			cipherT.start()
+			hashT = HashThread(hashState)
+			hashT.start()
+			threads.append(cipherT)
+			threads.append(hashT)
+
+		while(len(threads) > 0):
+			next = threads.pop()
+			next.join()
+
+		return hashState
+
+	def _mac(self, tag, root):
 		s = sha3.SHA3256()
-		s.update(''.join([root, self.auth_key, enc_tag]))
+		s.update(''.join([root, self.auth_key, tag]))
 		return s.hexdigest()
 
-#Verifiy a cipher text & encrypted tag against a provided MAC
-# Must not only match the mac, but check that the message is not expired and that the length
-# is correct
-class Verifier:
-	def __init__(self, auth_key, enc_key, enc_nonce):
-		self.signer = Signer(auth_key)
-		self.cipher = Cipher(enc_key, enc_nonce)
+	def get_root(self):
+		return self.root
 
-	def _validMac(self, ciphertext, enc_tag, mac):
-		return self.signer.mac(ciphertext, enc_tag) == mac
+	def get_result(self):
+		return ''.join(self.blocks)
 
-	def _timely(self):
-		return self.cipher.expiration() > time.time()
+	def get_tag(self):
+		return self.tag
 
-	def _validMsgLength(self, ciphertext):
-		return self.cipher.msgLen() == len(ciphertext)
+	def get_mac(self):
+		return self.mac
 
-	def verify(self, ciphertext, enc_tag, mac):
-		self.cipher.decryptTokens((len(ciphertext) // 16), enc_tag)
-		return self._validMac(ciphertext, enc_tag, mac) and self._timely() and self._validMsgLength(ciphertext)
+	def get_msg_len(self):
+		return self.msgLen
 
-def main():
-	msg = "0123456789abcdef0123456789ABCDEF"
-	expiration = int(time.time() + 1000)
+	def get_expiration(self):
+		return self.expiration
+
+	def authentic(self):
+		return self.valid
+
+	def encrypt_and_mac(self, msg, msgLen, expiration):
+		self.expiration = int(expiration)
+		self.msgLen = msgLen
+		tag = RAVe._int64_to_bytes(self.msgLen) + RAVe._int64_to_bytes(self.expiration)
+		blocks = RAVe._split_every(16, msg)
+		hashState = self._routine(blocks, tag, True)
+
+		self.root = hashState.get_root()
+		self.blocks = hashState.get_blocks()
+		self.tag = hashState.get_cipher_tag()
+		self.mac = self._mac(self.tag, self.root)
+
+	def decrypt_and_verify(self, ciphertext, enc_tag, mac):
+		self.mac = mac
+		self.tag = enc_tag
+		
+		cipherblocks = RAVe._split_every(16, ciphertext)
+		hashState = self._routine(cipherblocks, enc_tag, False)
+
+		plain_tag = hashState.get_plain_tag()
+		self.expiration = int(str(plain_tag[8:16]).encode('hex'), 16)
+		self.msgLen = int(str(plain_tag[0:8]).encode('hex'), 16)
+
+		self.root = hashState.get_root()
+		self.blocks = hashState.get_blocks()
+
+		self.valid = self.expiration > time.time()
+		self.valid = self.valid and self.msgLen == len(ciphertext)
+		self.valid = self.valid and self.mac == self._mac(enc_tag, self.root)
+
+def benchmark(auth_key, enc_key, enc_nonce, msg, threadCount, trials):
+	msgLen = len(msg)
+	expiration = time.time() + 1000000
+
+	send = RAVe(auth_key, enc_key, enc_nonce, threadCount)
+	recv = RAVe(auth_key, enc_key, enc_nonce, threadCount)
+	start = time.time()
+	i = 0
+	while(i < trials):
+		send.encrypt_and_mac(msg, msgLen, expiration)
+		i = i + 1
+
+	end = time.time()
+	print "TC: " + str(threadCount) + " msgLen: " + str(msgLen) + " EncTimeAvg: " + str((end - start)/trials)
+
+	start2 = time.time()
+	i = 0
+	while(i < trials):
+		recv.decrypt_and_verify(send.get_result(), send.get_tag(), send.get_mac())
+		if(not recv.authentic):
+			print "NOT VALID... exiting"
+			return
+		i = i + 1
+	end2 = time.time()
+	print "TC: " + str(threadCount) + " msgLen: " + str(msgLen) + " DecTimeAvg: " + str((end2 - start2)/trials)
+	print " == Total: " + str((end2 - start2)/trials + (end - start)/trials)
+	del send
+	del recv
+
+def benchmark_runner():
 	auth_key = "0123456789abcdef"
 	enc_key = "0123456789012345"
-	enc_nonce = "01234567890AB" #This should be random
+	enc_nonce = "0123456789AB" #This should be random
 
-	enc_cipher = Cipher(enc_key, enc_nonce)
-	dec_cipher = Cipher(enc_key, enc_nonce)
+	#64KB, 256KB, 1MB, 4MB, 16MB, 64MB, 256MB
+	msg = "0123456789abcdef"
+	msg = msg + msg + msg + msg + msg + msg + msg + msg
+	msg = msg + msg + msg + msg + msg + msg + msg + msg
 
-	ciphertext = enc_cipher.encrypt(msg, expiration)
-	enc_tag = enc_cipher.tag()
+	for i in xrange(1,7):
+		for tc in [16, 8, 4, 2, 1]:
+			gc.collect()
+			benchmark(auth_key, enc_key, enc_nonce, msg, tc, 1)
+		msg = msg + msg + msg + msg
 
-	signer = Signer(auth_key)
-	mac = signer.mac(ciphertext, enc_tag)
+def rerun_anomolies():
+	auth_key = "0123456789abcdef"
+	enc_key = "0123456789012345"
+	enc_nonce = "0123456789AB" #This should be random
 
-	verifier = Verifier(auth_key, enc_key, enc_nonce)
-	verified = verifier.verify(ciphertext, enc_tag, mac)
+	#64KB, 256KB, 1MB, 4MB, 16MB, 64MB, 256MB
+	msg = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	msg = msg + msg + msg + msg + msg + msg + msg + msg
+	msg = msg + msg + msg + msg + msg + msg + msg + msg
 
-	print(verified)
-	print(dec_cipher.decrypt(ciphertext))
+	print(len(msg))
+	gc.collect()
+	gc.collect()
+	benchmark(auth_key, enc_key, enc_nonce, msg, 4, 1)
 
-main()
+	gc.collect()
+	gc.collect()
+	benchmark(auth_key, enc_key, enc_nonce, msg, 1, 1)
+
+def main():
+	auth_key = "0123456789abcdef"
+	enc_key = "0123456789012345"
+	enc_nonce = "0123456789AB" #This should be random
+
+	msg = "0123456789abcdef0123456789abcdef"
+	msg = msg + msg + msg + msg + msg + msg + msg + msg
+	msg = msg + msg + msg + msg + msg + msg + msg + msg
+	msg = msg + msg + msg + msg + msg + msg + msg + msg
+	msg = msg + msg + msg + msg + msg + msg + msg + msg
+
+	print len(msg)
+	expiration = time.time() + 1000
+
+	#rave = RAVe(auth_key, enc_key, enc_nonce, 1)
+	#rave.encrypt_and_mac(msg, expiration)
+
+	rave = RAVe(auth_key, enc_key, enc_nonce, 16)
+	rave.encrypt_and_mac(msg, expiration)
+
+
+	#print "ciphertexts eq: " + str(binascii.hexlify(rave.get_result()) == binascii.hexlify(ravet.get_result()))
+	print "DECRYPT"
+
+	rave2 = RAVe(auth_key, enc_key, enc_nonce, 16)
+	rave2.decrypt_and_verify(rave.get_result(), rave.get_tag(), rave.get_mac())
+
+	#print rave2.get_result()
+	print rave2.authentic()
+	print binascii.hexlify(rave2.get_result()) == binascii.hexlify(msg)
+
+rerun_anomolies()
+#main()
