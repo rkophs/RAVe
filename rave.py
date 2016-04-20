@@ -58,14 +58,14 @@ class HashThread(threading.Thread):
 		elif length == 2:
 			half = length // 2;
 			return self._hash(self._merkle_hash(inputs[:half]), self._merkle_hash(inputs[half:]))
-		else:
-			print "ERROR"
 	def run(self):
 		while True:
 			next = self.results.pop();
 			if next == None:
 				continue
 			elif next == -1:
+				break
+			elif next[0] == -1:
 				break
 			layer = next[0]
 			key = next[1]
@@ -80,6 +80,7 @@ class CipherThread (threading.Thread):
 		self.enc_nonce = enc_nonce
 		self.queue = queue
 		self.results = results
+		self.cipher = Cipher(self.enc_key, self.enc_nonce)
 
 	def run(self):
 		while True:
@@ -88,51 +89,72 @@ class CipherThread (threading.Thread):
 				break
 			counter = tup[0]
 			block = tup[1]
-			cipher = Cipher(self.enc_key, self.enc_nonce)
-			enc = cipher.encrypt(block, counter)
+			enc = self.cipher.encrypt(block, counter)
 			self.results.pushBlock(counter, block, enc)
 
 class BlockLayers:
-	def __init__(self, entry_count, saveBlocks, encrypt):
-		self.lock = threading.Lock()
-		self.results = {}
-		self.results[0] = {}
+	def __init__(self, entry_count, saveBlocks, encrypt, threadCount):
+		self.queue = Queue.Queue(-1)
 		self.layer_count = int(math.ceil(math.log(entry_count,2)) + 1)
-		self.entry_count = entry_count
+		self.partials = {}
+		self.expects = []
+		self.locks = []
+
+		expect = entry_count
+		for i in xrange(0, self.layer_count):
+			self.partials[i] = {}
+			self.expects.append(expect)
+			self.locks.append(threading.Lock())
+			expect = (expect + (expect % 2)) // 2
+
 		self.saveBlocks = saveBlocks
 		self.blocks = []
 		self.encrypt = encrypt
+		self.threadCount = threadCount
 
 	def pushChild(self, layer, key, value):
-		self.lock.acquire()
-		if not layer in self.results:
-			self.results[layer] = {}
-		self.results[layer][key] = value
-		self.lock.release()
+		if self.layer_count - 1 == layer:
+			self.root = value
+			for i in xrange(0, self.threadCount):
+				self.queue.put(-1)
+			return
+
+		i = key - (key % 2)
+		if key == self.expects[layer] - 1:
+			self.queue.put([layer, i, [value]])
+			return
+
+		self.locks[layer].acquire()
+ 		if i in self.partials[layer]:
+			res = self.partials[layer][i]
+			res[key % 2] = value
+			self.queue.put([layer, i, res])
+			del self.partials[layer][i]
+		else:
+			res = [None, None]
+			res[key % 2] = value
+			self.partials[layer][i] = res
+		self.locks[layer].release()
 
 	def pushBlock(self, key, before_value, after_value):
-		self.lock.acquire()
-		if key == self.entry_count:
+		if key == self.expects[0]:
 			self.cipher_tag = after_value if self.encrypt else before_value
 			self.plain_tag = before_value if self.encrypt else after_value
-			self.lock.release()
 			return
+
+		value = after_value if self.encrypt else before_value
+		self.pushChild(0, key, value)
+
 		if self.saveBlocks:
 			size = len(after_value)
 			loc = key*size
 			self.blocks[loc:loc+size] = after_value
-		self.results[0][key] = after_value if self.encrypt else before_value
-		self.lock.release()
 
 	def get_blocks(self):
 		return self.blocks
 
 	def get_root(self):
-		res = None
-		self.lock.acquire()
-		res = self.root
-		self.lock.release()
-		return res
+		return self.root
 
 	def get_cipher_tag(self):
 		return self.cipher_tag
@@ -141,52 +163,7 @@ class BlockLayers:
 		return self.plain_tag
 
 	def pop(self):
-		self.lock.acquire()
-		if self.layer_count - 1 in self.results:
-			self.root = self.results[self.layer_count - 1][0]
-			self.lock.release()
-			return -1
-
-		expect = self.entry_count
-		for layer in sorted(self.results.keys()):
-			lastKey = -2
-			for key in sorted(self.results[layer].keys()):
-				##Two adjacent cipher blocks [0,1], [2,3], ...
-				if lastKey == key - 1 and (key % 2) == 1:
-					res = [layer, lastKey, [self.results[layer][lastKey], self.results[layer][key]]]
-					del self.results[layer][lastKey]
-					del self.results[layer][key]
-					self.lock.release()
-					return res
-				##Last cipher block expected
-				elif (key == expect - 1) and (key % 2 == 0):
-					res = [layer, key, [self.results[layer][key]]]
-					del self.results[layer][key]
-					self.lock.release()
-					return res
-				lastKey = key
-			expect = (expect + (expect % 2)) // 2
-		self.lock.release()
-		return None
-
-	def printlayers(self):
-		self.lock.acquire()
-		for layer in self.results:
-			#print "  Layer " + str(layer) + ":" + str(len(self.results[layer]))
-			if layer == 0:
-				if(len(self.results[layer])) > 0:
-					print sorted(self.results[layer].keys())
-		self.lock.release()
-
-	def printresults(self):
-		self.lock.acquire()
-		print "{"
-		for layer in self.results:
-			print "  Layer " + str(layer) + ":"
-			for key in self.results[layer]:
-				print "    " + str(key) + ": " + binascii.hexlify(self.results[layer][key])
-		print "}"
-		self.lock.release()
+		return self.queue.get()
 
 class Producer(threading.Thread):
 
@@ -232,14 +209,14 @@ class RAVe:
 		producer.start()
 		threads.append(producer)
 
-		hashState = BlockLayers(len(blocks), True, encrypt)
+		hashState = BlockLayers(len(blocks), True, encrypt, self.threadCount)
 
 		for i in range(self.threadCount):
 			cipherT = CipherThread(self.enc_key, self.enc_nonce, self.queue, hashState)
 			cipherT.start()
+			threads.append(cipherT)
 			hashT = HashThread(hashState)
 			hashT.start()
-			threads.append(cipherT)
 			threads.append(hashT)
 
 		while(len(threads) > 0):
@@ -342,62 +319,14 @@ def benchmark_runner():
 	msg = "0123456789abcdef"
 	msg = msg + msg + msg + msg + msg + msg + msg + msg
 	msg = msg + msg + msg + msg + msg + msg + msg + msg
+	msg = msg + msg + msg + msg + msg + msg + msg + msg
+	msg = msg + msg + msg + msg + msg + msg + msg + msg
 
 	for i in xrange(1,7):
-		for tc in [16, 8, 4, 2, 1]:
+		for tc in [128, 64, 32, 16, 8, 4]:
 			gc.collect()
 			benchmark(auth_key, enc_key, enc_nonce, msg, tc, 1)
 		msg = msg + msg + msg + msg
 
-def rerun_anomolies():
-	auth_key = "0123456789abcdef"
-	enc_key = "0123456789012345"
-	enc_nonce = "0123456789AB" #This should be random
-
-	#64KB, 256KB, 1MB, 4MB, 16MB, 64MB, 256MB
-	msg = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	msg = msg + msg + msg + msg + msg + msg + msg + msg
-	msg = msg + msg + msg + msg + msg + msg + msg + msg
-
-	print(len(msg))
-	gc.collect()
-	gc.collect()
-	benchmark(auth_key, enc_key, enc_nonce, msg, 16, 1)
-
-	gc.collect()
-	gc.collect()
-	benchmark(auth_key, enc_key, enc_nonce, msg, 1, 1)
-
-def main():
-	auth_key = "0123456789abcdef"
-	enc_key = "0123456789012345"
-	enc_nonce = "0123456789AB" #This should be random
-
-	msg = "0123456789abcdef0123456789abcdef"
-	msg = msg + msg + msg + msg + msg + msg + msg + msg
-	msg = msg + msg + msg + msg + msg + msg + msg + msg
-	msg = msg + msg + msg + msg + msg + msg + msg + msg
-	msg = msg + msg + msg + msg + msg + msg + msg + msg
-
-	print len(msg)
-	expiration = time.time() + 1000
-
-	#rave = RAVe(auth_key, enc_key, enc_nonce, 1)
-	#rave.encrypt_and_mac(msg, expiration)
-
-	rave = RAVe(auth_key, enc_key, enc_nonce, 16)
-	rave.encrypt_and_mac(msg, expiration)
-
-
-	#print "ciphertexts eq: " + str(binascii.hexlify(rave.get_result()) == binascii.hexlify(ravet.get_result()))
-	print "DECRYPT"
-
-	rave2 = RAVe(auth_key, enc_key, enc_nonce, 16)
-	rave2.decrypt_and_verify(rave.get_result(), rave.get_tag(), rave.get_mac())
-
-	#print rave2.get_result()
-	print rave2.authentic()
-	print binascii.hexlify(rave2.get_result()) == binascii.hexlify(msg)
-
-rerun_anomolies()
+benchmark_runner()
 #main()
